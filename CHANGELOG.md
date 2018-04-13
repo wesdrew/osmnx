@@ -1,11 +1,43 @@
 # Change log
 
-## 0.7 (TBD)
+## 0.7.4 (2018-04-05)
+
+  - add fast nearest-nodes search
+  - allow custom network query filters
+  - allow create_graph to return graph with no edges
+  - improve figure_ground joint smoothing
+  - fix handling of parallel edges when making multidigraph undirected
+  - generalize same-geometry checker
+  - improve detection of prior topology simplification
+  - custom error types for finer-grained handling
+
+## 0.7.3 (2018-03-12)
+
+  - turn off x- and y-axes to improve plotting appearance
+  - make floating-point precision and rounding more sensible
+  - improve OS path handling cross-platform
+  - replace great-circle distance calculator with haversine
+  - add access filter as configurable setting
+  - improve performance of inducing subgraphs
+  - fix utils.get_largest_component for networkx 2.2 compatibility
+  - fix config settings namespacing
+
+## 0.7.2 (2018-02-15)
+
+  - compatibility with networkx 2.1
+
+## 0.7.1 (2018-02-04)
+
+  - fix documentation build
+  - ignore ways marked access=no
+
+## 0.7 (2018-02-01)
 
   - ability to load a graph from a .osm file
   - change datum from NAD83 to WGS84
+  - make roundabouts one-way
+  - conformal plotting for unprojected graphs
   - fix folium web maps rendering
-  - convert tests to use offline cached HTTP responses
 
 ## 0.6 (2017-10-02)
 

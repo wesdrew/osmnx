@@ -6,28 +6,28 @@
 # Web: https://github.com/gboeing/osmnx
 ################################################################################
 
-import math
-import re
-import time
-import json
-import io
-import os
-import hashlib
 import datetime as dt
-import logging as lg
-import requests
-import numpy as np
-import pandas as pd
 import geopandas as gpd
+import hashlib
+import io
+import json
+import logging as lg
+import math
 import networkx as nx
+import numpy as np
+import os
+import pandas as pd
+import re
+import requests
+import time
 
 from collections import OrderedDict
-from itertools import groupby
 from dateutil import parser as date_parser
-from shapely.geometry import Point
+from itertools import groupby
 from shapely.geometry import LineString
-from shapely.geometry import Polygon
 from shapely.geometry import MultiPolygon
+from shapely.geometry import Point
+from shapely.geometry import Polygon
 from shapely.ops import unary_union
 
 from . import settings
@@ -42,6 +42,26 @@ from .utils import get_nearest_node
 from .utils import geocode
 from .utils import count_streets_per_node
 from .utils import overpass_json_from_file
+
+
+class EmptyOverpassResponse(ValueError):
+    def __init__(self,*args,**kwargs):
+        Exception.__init__(self,*args,**kwargs)
+
+
+class InvalidDistanceType(ValueError):
+    def __init__(self,*args,**kwargs):
+        Exception.__init__(self,*args,**kwargs)
+
+
+class UnknownNetworkType(ValueError):
+    def __init__(self,*args,**kwargs):
+        Exception.__init__(self,*args,**kwargs)
+
+
+class InsufficientNetworkQueryArguments(ValueError):
+    def __init__(self,*args,**kwargs):
+        Exception.__init__(self,*args,**kwargs)
 
 
 def save_to_cache(url, response_json):
@@ -78,7 +98,7 @@ def save_to_cache(url, response_json):
             # hash the url (to make filename shorter than the often extremely
             # long url)
             filename = hashlib.md5(url.encode('utf-8')).hexdigest()
-            cache_path_filename = '{}/{}.json'.format(settings.cache_folder, filename)
+            cache_path_filename = os.path.join(settings.cache_folder, os.extsep.join([filename, 'json']))
 
             # dump to json, and save to file
             json_str = make_str(json.dumps(response_json))
@@ -105,11 +125,13 @@ def get_from_cache(url):
     if settings.use_cache:
         # determine the filename by hashing the url
         filename = hashlib.md5(url.encode('utf-8')).hexdigest()
-        cache_path_filename = '{}/{}.json'.format(settings.cache_folder, filename)
+
+        cache_path_filename = os.path.join(settings.cache_folder, os.extsep.join([filename, 'json']))
         # open the cache file for this url hash if it already exists, otherwise
         # return None
         if os.path.isfile(cache_path_filename):
-            response_json = json.load(io.open(cache_path_filename, encoding='utf-8'))
+            with io.open(cache_path_filename, encoding='utf-8') as cache_file:
+                response_json = json.load(cache_file)
             log('Retrieved response from cache file "{}" for URL "{}"'.format(cache_path_filename, url))
             return response_json
 
@@ -374,7 +396,7 @@ def osm_polygon_download(query, limit=1, polygon_geojson=1):
         for key in sorted(list(query.keys())):
             params[key] = query[key]
     else:
-        raise ValueError('query must be a dict or a string')
+        raise TypeError('query must be a dict or a string')
 
     # request the URL, return the JSON
     response_json = nominatim_request(params=params, timeout=30)
@@ -429,11 +451,10 @@ def gdf_from_place(query, gdf_name=None, which_result=1, buffer_dist=None):
         if geometry['type'] not in ['Polygon', 'MultiPolygon']:
             log('OSM returned a {} as the geometry.'.format(geometry['type']), level=lg.WARNING)
 
-        # create the GeoDataFrame, name it, and set its original CRS to lat-long
-        # (EPSG 4326)
+        # create the GeoDataFrame, name it, and set its original CRS to default_crs
         gdf = gpd.GeoDataFrame.from_features(features)
         gdf.gdf_name = gdf_name
-        gdf.crs = {'init':'epsg:4326'}
+        gdf.crs = settings.default_crs
 
         # if buffer_dist was passed in, project the geometry to UTM, buffer it
         # in meters, then project it back to lat-long
@@ -483,8 +504,8 @@ def gdf_from_places(queries, gdf_name='unnamed', buffer_dist=None):
     gdf = gdf.reset_index().drop(labels='index', axis=1)
     gdf.gdf_name = gdf_name
 
-    # set the original CRS of the GeoDataFrame to lat-long, and return it
-    gdf.crs = {'init':'epsg:4326'}
+    # set the original CRS of the GeoDataFrame to default_crs, and return it
+    gdf.crs = settings.default_crs
     log('Finished creating GeoDataFrame with {} rows from {} queries'.format(len(gdf), len(queries)))
     return gdf
 
@@ -511,32 +532,33 @@ def get_osm_filter(network_type):
     # services
     filters['drive'] = ('["area"!~"yes"]["highway"!~"cycleway|footway|path|pedestrian|steps|track|corridor|'
                         'proposed|construction|bridleway|abandoned|platform|raceway|service"]'
-                        '["motor_vehicle"!~"no"]["motorcar"!~"no"]["access"!~"private"]'
-                        '["service"!~"parking|parking_aisle|driveway|private|emergency_access"]')
+                        '["motor_vehicle"!~"no"]["motorcar"!~"no"]{}'
+                        '["service"!~"parking|parking_aisle|driveway|private|emergency_access"]').format(settings.default_access)
 
     # drive+service: allow ways tagged 'service' but filter out certain types of
     # service ways
     filters['drive_service'] = ('["area"!~"yes"]["highway"!~"cycleway|footway|path|pedestrian|steps|track|corridor|'
                                 'proposed|construction|bridleway|abandoned|platform|raceway"]'
-                                '["motor_vehicle"!~"no"]["motorcar"!~"no"]["access"!~"private"]'
-                                '["service"!~"parking|parking_aisle|private|emergency_access"]')
+                                '["motor_vehicle"!~"no"]["motorcar"!~"no"]{}'
+                                '["service"!~"parking|parking_aisle|private|emergency_access"]').format(settings.default_access)
 
     # walking: filter out cycle ways, motor ways, private ways, and anything
     # specifying foot=no. allow service roads, permitting things like parking
     # lot lanes, alleys, etc that you *can* walk on even if they're not exactly
-    # pleasant walks
+    # pleasant walks. some cycleways may allow pedestrians, but this filter ignores
+    # such cycleways.
     filters['walk'] = ('["area"!~"yes"]["highway"!~"cycleway|motor|proposed|construction|abandoned|platform|raceway"]'
-                       '["foot"!~"no"]["service"!~"private"]["access"!~"private"]')
+                       '["foot"!~"no"]["service"!~"private"]{}').format(settings.default_access)
 
     # biking: filter out foot ways, motor ways, private ways, and anything
     # specifying biking=no
     filters['bike'] = ('["area"!~"yes"]["highway"!~"footway|corridor|motor|proposed|construction|abandoned|platform|raceway"]'
-                       '["bicycle"!~"no"]["service"!~"private"]["access"!~"private"]')
+                       '["bicycle"!~"no"]["service"!~"private"]{}').format(settings.default_access)
 
     # to download all ways, just filter out everything not currently in use or
     # that is private-access only
     filters['all'] = ('["area"!~"yes"]["highway"!~"proposed|construction|abandoned|platform|raceway"]'
-                      '["service"!~"private"]["access"!~"private"]')
+                      '["service"!~"private"]{}').format(settings.default_access)
 
     # to download all ways, including private-access ones, just filter out
     # everything not currently in use
@@ -548,14 +570,15 @@ def get_osm_filter(network_type):
     if network_type in filters:
         osm_filter = filters[network_type]
     else:
-        raise ValueError('unknown network_type "{}"'.format(network_type))
+        raise UnknownNetworkType('unknown network_type "{}"'.format(network_type))
 
     return osm_filter
 
 
 def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
                      network_type='all_private', timeout=180, memory=None,
-                     max_query_area_size=50*1000*50*1000, infrastructure='way["highway"]'):
+                     max_query_area_size=50*1000*50*1000, infrastructure='way["highway"]',
+                     custom_filter=None):
     """
     Download OSM ways and nodes within some bounding box from the Overpass API.
 
@@ -588,6 +611,8 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
         download infrastructure of given type. default is streets, ie,
         'way["highway"]') but other infrastructures may be selected like power
         grids, ie, 'way["power"~"line"]'
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -599,11 +624,15 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
     by_poly = polygon is not None
     by_bbox = not (north is None or south is None or east is None or west is None)
     if not (by_poly or by_bbox):
-        raise ValueError('You must pass a polygon or north, south, east, and west')
+        raise InsufficientNetworkQueryArguments(
+            'You must pass a polygon or north, south, east, and west')
 
     # create a filter to exclude certain kinds of ways based on the requested
     # network_type
-    osm_filter = get_osm_filter(network_type)
+    if custom_filter:
+        osm_filter = custom_filter
+    else:
+        osm_filter = get_osm_filter(network_type)
     response_jsons = []
 
     # pass server memory allocation in bytes for the query to the API
@@ -634,11 +663,11 @@ def osm_net_download(polygon=None, north=None, south=None, east=None, west=None,
         # loop through each polygon rectangle in the geometry (there will only
         # be one if original bbox didn't exceed max area size)
         for poly in geometry:
-            # represent bbox as south,west,north,east and round lat-longs to 8
-            # decimal places (ie, within 1 mm) so URL strings aren't different
+            # represent bbox as south,west,north,east and round lat-longs to 6
+            # decimal places (ie, ~100 mm) so URL strings aren't different
             # due to float rounding issues (for consistent caching)
             west, south, east, north = poly.bounds
-            query_template = '[out:json][timeout:{timeout}]{maxsize};({infrastructure}{filters}({south:.8f},{west:.8f},{north:.8f},{east:.8f});>;);out;'
+            query_template = '[out:json][timeout:{timeout}]{maxsize};({infrastructure}{filters}({south:.6f},{west:.6f},{north:.6f},{east:.6f});>;);out;'
             query_str = query_template.format(north=north, south=south,
                                               east=east, west=west,
                                               infrastructure=infrastructure,
@@ -694,7 +723,7 @@ def consolidate_subdivide_geometry(geometry, max_query_area_size):
     quadrat_width = math.sqrt(max_query_area_size)
 
     if not isinstance(geometry, (Polygon, MultiPolygon)):
-        raise ValueError('Geometry must be a shapely Polygon or MultiPolygon')
+        raise TypeError('Geometry must be a shapely Polygon or MultiPolygon')
 
     # if geometry is a MultiPolygon OR a single Polygon whose area exceeds the
     # max size, get the convex hull around the geometry
@@ -714,7 +743,7 @@ def consolidate_subdivide_geometry(geometry, max_query_area_size):
 def get_polygons_coordinates(geometry):
     """
     Extract exterior coordinates from polygon(s) to pass to OSM in a query by
-    polygon.
+    polygon. Ignore the interior ("holes") coordinates.
 
     Parameters
     ----------
@@ -736,7 +765,7 @@ def get_polygons_coordinates(geometry):
             x, y = polygon.exterior.xy
             polygons_coords.append(list(zip(x, y)))
     else:
-        raise ValueError('Geometry must be a shapely Polygon or MultiPolygon')
+        raise TypeError('Geometry must be a shapely Polygon or MultiPolygon')
 
     # convert the exterior coordinates of the polygon(s) to the string format
     # the API expects
@@ -745,9 +774,9 @@ def get_polygons_coordinates(geometry):
         s = ''
         separator = ' '
         for coord in list(coords):
-            # round floating point lats and longs to 14 places, so we can hash
-            # and cache strings consistently
-            s = '{}{}{:.14f}{}{:.14f}'.format(s, separator, coord[1], separator, coord[0])
+            # round floating point lats and longs to 6 decimal places (ie, ~100 mm),
+            # so we can hash and cache strings consistently
+            s = '{}{}{:.6f}{}{:.6f}'.format(s, separator, coord[1], separator, coord[0])
         polygon_coord_strs.append(s.strip(separator))
 
     return polygon_coord_strs
@@ -1132,8 +1161,7 @@ def truncate_graph_polygon(G, polygon, retain_all=False, truncate_by_edge=False,
     G.remove_nodes_from(nodes_outside_polygon['node'])
     log('Removed {:,} nodes outside polygon in {:,.2f} seconds'.format(len(nodes_outside_polygon), time.time()-start_time))
 
-    # remove any isolated nodes and retain only the largest component (if
-    # retain_all is True)
+    # remove any isolated nodes and retain only the largest component (if retain_all is False)
     if not retain_all:
         G = remove_isolated_nodes(G)
         G = get_largest_component(G)
@@ -1170,7 +1198,8 @@ def add_edge_lengths(G):
                                     lat2=df_coords['v_y'],
                                     lng2=df_coords['v_x'])
 
-    gc_distances = gc_distances.fillna(value=0)
+    # fill nulls with zeros and round to the millimeter
+    gc_distances = gc_distances.fillna(value=0).round(3)
     nx.set_edge_attributes(G, name='length', values=gc_distances.to_dict())
 
     log('Added edge lengths to graph in {:,.2f} seconds'.format(time.time()-start_time))
@@ -1248,6 +1277,10 @@ def add_paths(G, paths, network_type):
             # add this path (in only one direction) to the graph
             add_path(G, data, one_way=True)
 
+        elif ('junction' in data and data['junction'] == 'roundabout') and not network_type == 'walk':
+            # roundabout are also oneway but not tagged as is
+            add_path(G, data, one_way=True)
+
         # else, this path is not tagged as one-way or it is a walking network
         # (you can walk both directions on a one-way street)
         else:
@@ -1288,10 +1321,10 @@ def create_graph(response_jsons, name='unnamed', retain_all=False, network_type=
     for response_json in response_jsons:
         elements.extend(response_json['elements'])
     if len(elements) < 1:
-        raise ValueError('There are no data elements in the response JSON objects')
+        raise EmptyOverpassResponse('There are no data elements in the response JSON objects')
 
-    # create the graph as a MultiDiGraph and set the original CRS to EPSG 4326
-    G = nx.MultiDiGraph(name=name, crs={'init':'epsg:4326'})
+    # create the graph as a MultiDiGraph and set the original CRS to default_crs
+    G = nx.MultiDiGraph(name=name, crs=settings.default_crs)
 
     # extract nodes and paths from the downloaded osm data
     nodes = {}
@@ -1319,12 +1352,13 @@ def create_graph(response_jsons, name='unnamed', retain_all=False, network_type=
 
     # add length (great circle distance between nodes) attribute to each edge to
     # use as weight
-    G = add_edge_lengths(G)
+    if len(G.edges) > 0:
+        G = add_edge_lengths(G)
 
     return G
 
 
-def bbox_from_point(point, distance=1000, project_utm=False):
+def bbox_from_point(point, distance=1000, project_utm=False, return_crs=False):
     """
     Create a bounding box some distance in each direction (north, south, east,
     and west) from some (lat, lng) point.
@@ -1338,10 +1372,13 @@ def bbox_from_point(point, distance=1000, project_utm=False):
         each be from the point
     project_utm : bool
         if True return bbox as UTM coordinates
+    return_crs : bool
+        if True and project_utm=True, return the projected CRS
 
     Returns
     -------
-    north, south, east, west : tuple
+    north, south, east, west : tuple, if return_crs=False
+    north, south, east, west, crs_proj : tuple, if return_crs=True
     """
 
     # reverse the order of the (lat,lng) point so it is (x,y) for shapely, then
@@ -1360,14 +1397,17 @@ def bbox_from_point(point, distance=1000, project_utm=False):
         west, south, east, north = buffer_latlong.bounds
         log('Created bounding box {} meters in each direction from {}: {},{},{},{}'.format(distance, point, north, south, east, west))
 
-    return north, south, east, west
+    if return_crs:
+        return north, south, east, west, crs_proj
+    else:
+        return north, south, east, west
 
 
 def graph_from_bbox(north, south, east, west, network_type='all_private',
                     simplify=True, retain_all=False, truncate_by_edge=False,
                     name='unnamed', timeout=180, memory=None,
                     max_query_area_size=50*1000*50*1000, clean_periphery=True,
-                    infrastructure='way["highway"]'):
+                    infrastructure='way["highway"]', custom_filter=None):
     """
     Create a networkx graph from OSM data within some bounding box.
 
@@ -1406,6 +1446,8 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
     infrastructure : string
         download infrastructure of given type (default is streets (ie, 'way["highway"]') but other
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -1426,7 +1468,7 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
                                           east=east_buffered, west=west_buffered,
                                           network_type=network_type, timeout=timeout,
                                           memory=memory, max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure)
+                                          infrastructure=infrastructure, custom_filter=custom_filter)
         G_buffered = create_graph(response_jsons, name=name, retain_all=retain_all, network_type=network_type)
         G = truncate_graph_bbox(G_buffered, north, south, east, west, retain_all=True, truncate_by_edge=truncate_by_edge)
 
@@ -1448,7 +1490,7 @@ def graph_from_bbox(north, south, east, west, network_type='all_private',
                                           west=west, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure)
+                                          infrastructure=infrastructure, custom_filter=custom_filter)
 
         # create the graph, then truncate to the bounding box
         G = create_graph(response_jsons, name=name, retain_all=retain_all, network_type=network_type)
@@ -1469,7 +1511,8 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
                      network_type='all_private', simplify=True, retain_all=False,
                      truncate_by_edge=False, name='unnamed', timeout=180,
                      memory=None, max_query_area_size=50*1000*50*1000,
-                     clean_periphery=True, infrastructure='way["highway"]'):
+                     clean_periphery=True, infrastructure='way["highway"]',
+                     custom_filter=None):
     """
     Create a networkx graph from OSM data within some distance of some (lat,
     lon) center point.
@@ -1510,6 +1553,8 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
     infrastructure : string
         download infrastructure of given type (default is streets (ie, 'way["highway"]') but other
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -1517,16 +1562,18 @@ def graph_from_point(center_point, distance=1000, distance_type='bbox',
     """
 
     if distance_type not in ['bbox', 'network']:
-        raise ValueError('distance_type must be "bbox" or "network"')
+        raise InvalidDistanceType('distance_type must be "bbox" or "network"')
 
     # create a bounding box from the center point and the distance in each
     # direction
     north, south, east, west = bbox_from_point(center_point, distance)
 
     # create a graph from the bounding box
-    G = graph_from_bbox(north, south, east, west, network_type=network_type, simplify=simplify, retain_all=retain_all,
-                        truncate_by_edge=truncate_by_edge, name=name, timeout=timeout, memory=memory,
-                        max_query_area_size=max_query_area_size, clean_periphery=clean_periphery, infrastructure=infrastructure)
+    G = graph_from_bbox(north, south, east, west, network_type=network_type, simplify=simplify,
+                        retain_all=retain_all, truncate_by_edge=truncate_by_edge, name=name, 
+                        timeout=timeout, memory=memory, max_query_area_size=max_query_area_size, 
+                        clean_periphery=clean_periphery, infrastructure=infrastructure,
+                        custom_filter=custom_filter)
 
     # if the network distance_type is network, find the node in the graph
     # nearest to the center point, and truncate the graph by network distance
@@ -1544,7 +1591,8 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
                        truncate_by_edge=False, return_coords=False,
                        name='unnamed', timeout=180, memory=None,
                        max_query_area_size=50*1000*50*1000,
-                       clean_periphery=True, infrastructure='way["highway"]'):
+                       clean_periphery=True, infrastructure='way["highway"]',
+                       custom_filter=None):
     """
     Create a networkx graph from OSM data within some distance of some address.
 
@@ -1588,6 +1636,8 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
     infrastructure : string
         download infrastructure of given type (default is streets (ie, 'way["highway"]') but other
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -1603,7 +1653,8 @@ def graph_from_address(address, distance=1000, distance_type='bbox',
                          simplify=simplify, retain_all=retain_all, truncate_by_edge=truncate_by_edge,
                          name=name, timeout=timeout, memory=memory,
                          max_query_area_size=max_query_area_size,
-                         clean_periphery=clean_periphery, infrastructure=infrastructure)
+                         clean_periphery=clean_periphery, infrastructure=infrastructure,
+                         custom_filter=custom_filter)
     log('graph_from_address() returning graph with {:,} nodes and {:,} edges'.format(len(list(G.nodes())), len(list(G.edges()))))
 
     if return_coords:
@@ -1616,7 +1667,8 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
                        retain_all=False, truncate_by_edge=False, name='unnamed',
                        timeout=180, memory=None,
                        max_query_area_size=50*1000*50*1000,
-                       clean_periphery=True, infrastructure='way["highway"]'):
+                       clean_periphery=True, infrastructure='way["highway"]',
+                       custom_filter=None):
     """
     Create a networkx graph from OSM data within the spatial boundaries of the
     passed-in shapely polygon.
@@ -1649,8 +1701,11 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         if True (and simplify=True), buffer 0.5km to get a graph larger than
         requested, then simplify, then truncate it to requested spatial extent
     infrastructure : string
-        download infrastructure of given type (default is streets (ie, 'way["highway"]') but other
-        infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
+        download infrastructure of given type (default is streets
+        (ie, 'way["highway"]') but other infrastructures may be selected 
+        like power grids (ie, 'way["power"~"line"]'))
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -1660,9 +1715,12 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
     # verify that the geometry is valid and is a shapely Polygon/MultiPolygon
     # before proceeding
     if not polygon.is_valid:
-        raise ValueError('Shape does not have a valid geometry')
+        raise TypeError('Shape does not have a valid geometry')
     if not isinstance(polygon, (Polygon, MultiPolygon)):
-        raise ValueError('Geometry must be a shapely Polygon or MultiPolygon')
+        raise TypeError('Geometry must be a shapely Polygon or MultiPolygon. If you requested '
+                         'graph from place name or address, make sure your query resolves to a '
+                         'Polygon or MultiPolygon, and not some other geometry, like a Point. '
+                         'See OSMnx documentation for details.')
 
     if clean_periphery and simplify:
         # create a new buffered polygon 0.5km around the desired one
@@ -1676,7 +1734,7 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         response_jsons = osm_net_download(polygon=polygon_buffered, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure)
+                                          infrastructure=infrastructure, custom_filter=custom_filter)
         G_buffered = create_graph(response_jsons, name=name, retain_all=True, network_type=network_type)
         G_buffered = truncate_graph_polygon(G_buffered, polygon_buffered, retain_all=True, truncate_by_edge=truncate_by_edge)
 
@@ -1700,7 +1758,7 @@ def graph_from_polygon(polygon, network_type='all_private', simplify=True,
         response_jsons = osm_net_download(polygon=polygon, network_type=network_type,
                                           timeout=timeout, memory=memory,
                                           max_query_area_size=max_query_area_size,
-                                          infrastructure=infrastructure)
+                                          infrastructure=infrastructure, custom_filter=custom_filter)
 
         # create the graph from the downloaded data
         G = create_graph(response_jsons, name=name, retain_all=True, network_type=network_type)
@@ -1723,7 +1781,7 @@ def graph_from_place(query, network_type='all_private', simplify=True,
                      retain_all=False, truncate_by_edge=False, name='unnamed',
                      which_result=1, buffer_dist=None, timeout=180, memory=None,
                      max_query_area_size=50*1000*50*1000, clean_periphery=True,
-                     infrastructure='way["highway"]'):
+                     infrastructure='way["highway"]', custom_filter=None):
     """
     Create a networkx graph from OSM data within the spatial boundaries of some
     geocodable place(s).
@@ -1771,6 +1829,8 @@ def graph_from_place(query, network_type='all_private', simplify=True,
     infrastructure : string
         download infrastructure of given type (default is streets (ie, 'way["highway"]') but other
         infrastructures may be selected like power grids (ie, 'way["power"~"line"]'))
+    custom_filter : string
+        a custom network filter to be used instead of the network_type presets
 
     Returns
     -------
@@ -1787,7 +1847,7 @@ def graph_from_place(query, network_type='all_private', simplify=True,
         # if it is a list, it contains multiple places to get
         gdf_place = gdf_from_places(query, buffer_dist=buffer_dist)
     else:
-        raise ValueError('query must be a string or a list of query strings')
+        raise TypeError('query must be a string or a list of query strings')
 
     # extract the geometry from the GeoDataFrame to use in API query
     polygon = gdf_place['geometry'].unary_union
@@ -1798,7 +1858,8 @@ def graph_from_place(query, network_type='all_private', simplify=True,
                            retain_all=retain_all, truncate_by_edge=truncate_by_edge,
                            name=name, timeout=timeout, memory=memory,
                            max_query_area_size=max_query_area_size,
-                           clean_periphery=clean_periphery, infrastructure=infrastructure)
+                           clean_periphery=clean_periphery, infrastructure=infrastructure,
+                           custom_filter=custom_filter)
 
     log('graph_from_place() returning graph with {:,} nodes and {:,} edges'.format(len(list(G.nodes())), len(list(G.edges()))))
     return G
